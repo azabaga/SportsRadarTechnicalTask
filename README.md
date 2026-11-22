@@ -1,4 +1,4 @@
-# Offer service
+# Offer servic
 
 The Java 21 and Spring Boot service loads the offer from two filesystem JSON files, serves the visible offer over HTTP, and periodically removes expired events from memory. [STI-2](https://azabaga.atlassian.net/browse/STI-2)
 
