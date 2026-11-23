@@ -35,8 +35,10 @@ public final class InMemoryOfferStore {
                 List.copyOf(merged.values()));
     }
 
-    public synchronized void removeStartedEvents(Instant now) {
+    public synchronized int removeStartedEvents(Instant now) {
+        int before = events.size();
         events.values().removeIf(event -> event.hasStarted(now));
+        return before - events.size();
     }
 
     synchronized Snapshot snapshot() {

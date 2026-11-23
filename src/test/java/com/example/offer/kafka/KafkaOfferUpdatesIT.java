@@ -48,15 +48,7 @@ class KafkaOfferUpdatesIT {
 
         try (var admin = Admin.create(connection);
              var producer = new KafkaProducer<>(producerProperties, new StringSerializer(), new StringSerializer());
-             var context = (ServletWebServerApplicationContext) new SpringApplicationBuilder(OfferApplication.class)
-                     .profiles("kafka")
-                     .initializers(application -> ((GenericApplicationContext) application).registerBean(
-                             "fixedClock", Clock.class,
-                             () -> Clock.fixed(Instant.parse("2030-06-01T20:00:00Z"), ZoneOffset.UTC),
-                             definition -> definition.setPrimary(true)))
-                     .run("--server.address=127.0.0.1", "--server.port=0", "--spring.main.banner-mode=off",
-                             "--logging.level.root=WARN", "--offer.kafka.bootstrap-servers=" + bootstrap,
-                             "--offer.kafka.group-id=" + group);
+             var context = start(bootstrap, group);
              var http = HttpClient.newHttpClient()) {
             var topics = admin.describeTopics(List.of("market", "event")).allTopicNames().get(10, TimeUnit.SECONDS);
             assertEquals(1, topics.get("market").partitions().size());
@@ -111,21 +103,42 @@ class KafkaOfferUpdatesIT {
                         && !findById(event.path("markets"), "1-2").isMissingNode();
             });
 
-            var rejected = producer.send(new ProducerRecord<>("event", "1", """
-                    {"id":"different","name":"Wrong key","startsAt":"2032-05-01T20:00:00","status":1,"markets":[]}
-                    """)).get(10, TimeUnit.SECONDS);
-            var later = producer.send(new ProducerRecord<>("event", "1", """
-                    {"id":"1","name":"This record must wait","startsAt":"2032-05-01T20:00:00","status":1,"markets":[]}
-                    """)).get(10, TimeUnit.SECONDS);
-            assertEquals(delta.partition(), rejected.partition());
-            assertEquals(rejected.partition(), later.partition());
-            var registry = context.getBean(KafkaListenerEndpointRegistry.class);
-            await("the event listener to stop", () -> !registry.getListenerContainer("event-updates").isRunning());
+            var beforeRestart = getOffer(http, request);
+            context.close();
+            try (var restarted = start(bootstrap, group)) {
+                var restoredRequest = HttpRequest.newBuilder(URI.create("http://127.0.0.1:"
+                        + restarted.getWebServer().getPort() + "/offer")).build();
+                assertEquals(beforeRestart, getOffer(http, restoredRequest));
+                var rejected = producer.send(new ProducerRecord<>("event", "1", """
+                        {"id":"different","name":"Wrong key","startsAt":"2032-05-01T20:00:00","status":1,"markets":[]}
+                        """)).get(10, TimeUnit.SECONDS);
+                var later = producer.send(new ProducerRecord<>("event", "1", """
+                        {"id":"1","name":"This record must wait","startsAt":"2032-05-01T20:00:00","status":1,"markets":[]}
+                        """)).get(10, TimeUnit.SECONDS);
+                assertEquals(delta.partition(), rejected.partition());
+                assertEquals(rejected.partition(), later.partition());
+                var registry = restarted.getBean(KafkaListenerEndpointRegistry.class);
+                await("the event listener to stop", () -> !registry.getListenerContainer("event-updates").isRunning());
 
-            var offsets = admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS);
-            assertEquals(rejected.offset(), offsets.get(new TopicPartition("event", rejected.partition())).offset());
-            assertEquals("Real Barcelona updated", findById(getOffer(http, request).path("events"), "1").path("name").asString());
+                var offsets = admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS);
+                assertEquals(rejected.offset(), offsets.get(new TopicPartition("event", rejected.partition())).offset());
+                assertEquals("Real Barcelona updated", findById(getOffer(http, restoredRequest).path("events"), "1").path("name").asString());
+                var ready = HttpRequest.newBuilder(restoredRequest.uri().resolve("/health/ready")).build();
+                assertEquals(503, http.send(ready, HttpResponse.BodyHandlers.ofString()).statusCode());
+            }
         }
+    }
+
+    private static ServletWebServerApplicationContext start(String bootstrap, String group) {
+        return (ServletWebServerApplicationContext) new SpringApplicationBuilder(OfferApplication.class)
+                     .profiles("kafka")
+                     .initializers(application -> ((GenericApplicationContext) application).registerBean(
+                             "fixedClock", Clock.class,
+                             () -> Clock.fixed(Instant.parse("2030-06-01T20:00:00Z"), ZoneOffset.UTC),
+                             definition -> definition.setPrimary(true)))
+                     .run("--server.address=127.0.0.1", "--server.port=0", "--spring.main.banner-mode=off",
+                             "--logging.level.root=WARN", "--offer.kafka.bootstrap-servers=" + bootstrap,
+                             "--offer.kafka.group-id=" + group);
     }
 
     private static JsonNode getOffer(HttpClient http, HttpRequest request) throws Exception {
