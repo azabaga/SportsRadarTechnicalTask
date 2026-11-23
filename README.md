@@ -77,4 +77,50 @@ An event market's `marketId` refers to `markets[].id`. Resolve an `outcomeId` us
 - `OfferController` validates the query. `OfferService` filters events, resolves only active references, and collects the definitions actually used. `OfferCleanup` applies the same clock rule to remove records from the store.
 - `updateMarket` replaces the full definition. `updateEvent` uses the incoming event metadata and merges market instances by ID. Each supplied instance replaces its full outcome list, and absent instances remain.
 
-STI-3 will connect those update methods to explicitly configured Spring Kafka clients and define ordering, offsets, and error handling. State currently starts from the configured files on every launch. Broker-based restart and replay are tracked in STI-4.
+## Kafka updates
+
+Start a local plaintext Apache Kafka broker in one terminal. The application creates `market` with one partition and `event` with two, using replication factor one for new topics. It checks those counts on startup, and accepts an existing `event` topic with more than two partitions.
+
+```sh
+docker run --rm --name offer-kafka -p 127.0.0.1:9092:9092 apache/kafka:4.2.2
+```
+
+Once the broker is ready, run the application with the `kafka` Spring profile from the project root.
+
+```sh
+./mvnw spring-boot:run -Dspring-boot.run.profiles=kafka
+```
+
+The profile defaults to `offer.kafka.bootstrap-servers=localhost:9092` and `offer.kafka.group-id=offer-service`. Override them with Spring command-line properties when using an executable JAR. Without the profile, the service runs from the JSON files alone.
+
+Each Kafka value is one UTF-8 JSON object in the Appendix 2 format. The `market` topic expects the full definition, including the full outcome list. The `event` topic expects event metadata and a list of event market instances. An event record's string key must match its JSON `id`. Updates merge using each event market instance's `id` (for example `1-1`), while `marketId` continues to reference the shared definition (for example `3way`).
+
+To see an event update on the API, publish the following record. The text before the first pipe is the Kafka key.
+
+```sh
+docker exec -i offer-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic event \
+  --property parse.key=true --property 'key.separator=|' <<'EOF'
+1|{"id":"1","name":"Real Barcelona","startsAt":"2032-05-01T20:00:00","status":1,"markets":[{"id":"1-1","marketId":"3way","status":1,"outcomes":[{"id":"1-1-1","outcomeId":"3way-1","status":1,"odds":1.9}]}]}
+EOF
+curl -fsS 'http://localhost:8080/offer'
+```
+
+Once consumed, the response shows odds of `1.9` for the updated outcome.
+
+### Ordering, offsets and failures
+
+- **Ordering.** Each partition is consumed in offset order. The single market partition orders all market updates. Producers should use the event ID as the key with Kafka's standard partitioner and leave the partition unspecified. Updates for the same event then share a partition while the partition count is fixed. Different event partitions and the two topics progress independently. The HTTP API may observe a market or event update arriving before its counterpart, and applies the existing reference visibility rules.
+- **Offsets.** Auto-commit is disabled. The consumer commits offsets synchronously, one record at a time after the listener has applied the update to the in-memory store. A successful update can be delivered again if its offset was not committed. A group with no usable offset starts at the earliest retained record.
+- **Failures.** Invalid JSON, invalid domain data, null values, missing or mismatched event keys, and exceptions while applying a record stop the affected topic's listener container. The failure log identifies the topic, partition and offset. The failed record stays uncommitted, so subsequent records in its partition wait for operator intervention. The other topic listener and HTTP service can continue with the state already applied. Inspect the record and fix the cause before resuming consumption. A permanently invalid record requires an explicit operator decision to skip its offset.
+- **State lifetime.** Run one application instance for one complete offer. Each instance has its own memory, and Kafka consumer groups distribute partitions between instances. A process restart loads the fixture files again and the existing Kafka group resumes from committed offsets. Restoring the complete offer across restarts is tracked in STI-4.
+
+### Real broker integration test
+
+Run on a fresh, dedicated broker because the test writes to `market` and `event`, including a deliberate invalid record. Start a new container with the command above, then run:
+
+```sh
+./mvnw -Pkafka-it clean verify
+```
+
+The test checks the partition counts, publishes updates, waits for the HTTP response to reflect event and market changes, and confirms an invalid event key stops consumption without advancing past the rejected record. Use `-Dkafka.it.bootstrap-servers=localhost:19092` to target a different broker address.

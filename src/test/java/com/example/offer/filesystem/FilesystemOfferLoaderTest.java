@@ -4,6 +4,7 @@ import com.example.offer.OfferApplication;
 import com.example.offer.domain.Event;
 import com.example.offer.domain.Market;
 import com.example.offer.domain.MarketOutcome;
+import com.example.offer.json.OfferJson;
 import jakarta.validation.Validation;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -32,7 +33,7 @@ class FilesystemOfferLoaderTest {
     @Test
     void loadsBothAppendixFilesIncludingInactiveAndExpiredSourceData() {
         try (var validatorFactory = Validation.buildDefaultValidatorFactory()) {
-            var loader = new FilesystemOfferLoader(validatorFactory.getValidator());
+            var loader = new FilesystemOfferLoader(new OfferJson(validatorFactory.getValidator()));
             var markets = loader.read(Path.of("fixtures/appendix-1-markets.json"), Market.class, Market::id);
             var events = loader.read(Path.of("fixtures/appendix-1-events.json"), Event.class, Event::id);
 
@@ -57,7 +58,7 @@ class FilesystemOfferLoaderTest {
                 [{"id":"e","name":"Event","startsAt":"2032-05-02T01:00:00+05:00","status":1,"markets":[]}]
                 """);
         try (var validatorFactory = Validation.buildDefaultValidatorFactory()) {
-            var loader = new FilesystemOfferLoader(validatorFactory.getValidator());
+            var loader = new FilesystemOfferLoader(new OfferJson(validatorFactory.getValidator()));
             assertEquals(Instant.parse("2032-05-01T20:00:00Z"),
                     loader.read(events, Event.class, Event::id).getFirst().startsAt());
         }
@@ -79,7 +80,7 @@ class FilesystemOfferLoaderTest {
     void rejectsInvalidInitialRecords(String json) throws IOException {
         var invalid = Files.writeString(directory.resolve("invalid-markets.json"), json);
         try (var validatorFactory = Validation.buildDefaultValidatorFactory()) {
-            var loader = new FilesystemOfferLoader(validatorFactory.getValidator());
+            var loader = new FilesystemOfferLoader(new OfferJson(validatorFactory.getValidator()));
             var failure = assertThrows(IllegalStateException.class,
                     () -> loader.read(invalid, Market.class, Market::id));
             assertTrue(failure.getMessage().contains(invalid.toString()), failure::getMessage);
