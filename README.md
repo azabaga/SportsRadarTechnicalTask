@@ -1,8 +1,41 @@
 # Offer service
 
-The Java 21 and Spring Boot service loads the offer from two filesystem JSON files, serves the visible offer over HTTP, and periodically removes expired events from memory. [STI-2](https://azabaga.atlassian.net/browse/STI-2)
+This Java 21 service loads a filesystem seed, applies ordered Kafka updates to an in-memory offer and serves active upcoming events over HTTP.
 
-## Run locally
+## Start the complete service
+
+From the repository root, with Docker Engine and Docker Compose installed, run:
+
+```sh
+docker compose up -d --build --wait
+curl -fsS http://localhost:8080/health/ready
+curl -fsS http://localhost:8080/offer
+```
+
+Open [Redpanda Console](http://localhost:8081) and select **Topics**, then **market** or **event**, then **Messages** to inspect records and event keys. The [OpenAPI specification](http://localhost:8080/openapi.yaml) documents the public response. The first build needs internet access to pull images and Maven dependencies. Compose runs the Java build and unit tests in the builder image.
+
+`docker compose ps` shows service status. Use `docker compose logs -f app` to follow replay boundaries, partition assignment, cleanup counts and rejected records. `GET /health/live` checks the HTTP process. With Kafka enabled, `GET /health/ready` returns 200 after startup replay when both topic listeners are running with assignments, or 503 while waiting or after a listener stops. It does not measure consumer lag. Host ports bind to loopback. Override `OFFER_PORT`, `KAFKA_PORT` and `CONSOLE_PORT` if occupied.
+
+`docker compose down` stops the stack and retains Kafka data. The next `docker compose up -d --wait` rebuilds the offer from the seed and retained records.
+
+## Reviewer demo
+
+On a freshly started stack with empty topics, run the following from the project root with Python 3:
+
+```sh
+python3 scripts/demo.py
+```
+
+The demo prints and checks the filtered Appendix 1 offer, publishes both Appendix 2 examples, adds a second market to event 3 and verifies that its original market survives. It restarts the app, compares the full HTTP response, then publishes a short-lived event, observes it expire and checks the scheduled removal log. The fixed appendix examples require the current clock to be before June 2, 2030 at 20:00 UTC. Automated tests use a fixed clock. The demo writes to the selected Compose project. To repeat against a fresh dedicated environment, select an unused Compose project name and unused host ports:
+
+```sh
+export COMPOSE_PROJECT_NAME=offer-demo2 OFFER_PORT=18080 KAFKA_PORT=19092 CONSOLE_PORT=18081
+docker compose up -d --build --wait
+python3 scripts/demo.py
+docker compose down
+```
+
+## Run Java locally without Docker
 
 Run these commands from the project root with a Java 21 JDK. The Maven Wrapper downloads Maven 3.9.12 and the build resolves dependencies from Maven Central on its first run.
 
@@ -77,4 +110,52 @@ An event market's `marketId` refers to `markets[].id`. Resolve an `outcomeId` us
 - `OfferController` validates the query. `OfferService` filters events, resolves only active references, and collects the definitions actually used. `OfferCleanup` applies the same clock rule to remove records from the store.
 - `updateMarket` replaces the full definition. `updateEvent` uses the incoming event metadata and merges market instances by ID. Each supplied instance replaces its full outcome list, and absent instances remain.
 
-STI-3 will connect those update methods to explicitly configured Spring Kafka clients and define ordering, offsets, and error handling. State currently starts from the configured files on every launch. Broker-based restart and replay are tracked in STI-4.
+## Kafka updates
+
+Compose starts an unauthenticated Apache Kafka broker. The service provisions one `market` partition and two `event` partitions, with replication factor one. Existing event topics may have more partitions. To develop with the Java process on your host, start only the broker and UI in Compose:
+
+```sh
+docker compose up -d --wait kafka console
+./mvnw spring-boot:run -Dspring-boot.run.profiles=kafka
+```
+
+The Kafka profile defaults to `offer.kafka.bootstrap-servers=localhost:9092` and `offer.kafka.group-id=offer-service`. Without the profile, the service reads just the JSON seed.
+
+Each Kafka value is one UTF-8 JSON object in the Appendix 2 format. The `market` topic expects the full definition, including the full outcome list. The `event` topic expects event metadata and a list of event market instances. An event record's string key must match its JSON `id`. Updates merge using each event market instance's `id` (for example `1-1`), while `marketId` continues to reference the shared definition (for example `3way`).
+
+To see an event update on the API, publish the following record. The text before the first pipe is the Kafka key.
+
+```sh
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server kafka:29092 --topic event \
+  --reader-property parse.key=true --reader-property 'key.separator=|' <<'EOF'
+1|{"id":"1","name":"Real Barcelona","startsAt":"2032-05-01T20:00:00","status":1,"markets":[{"id":"1-1","marketId":"3way","status":1,"outcomes":[{"id":"1-1-1","outcomeId":"3way-1","status":1,"odds":1.9}]}]}
+EOF
+curl -fsS 'http://localhost:8080/offer'
+```
+
+Once consumed, the response shows odds of `1.9` for the updated outcome.
+
+### Ordering, offsets and failures
+
+- **Ordering.** Each partition is consumed in offset order. The single market partition orders all market updates. Producers should use the event ID as the key with Kafka's standard partitioner and leave the partition unspecified. Updates for the same event then share a partition while the partition count is fixed. Different event partitions and the two topics progress independently. The HTTP API may observe a market or event update arriving before its counterpart, and applies the existing reference visibility rules.
+- **Offsets.** Auto-commit is disabled. The consumer commits offsets synchronously, one record at a time after the listener has applied the update to the in-memory store. A successful update can be delivered again if its offset was not committed. A group with no usable offset starts at the earliest retained record.
+- **Failures.** Invalid JSON, invalid domain data, null values, missing or mismatched event keys, and exceptions while applying a record stop the affected topic's listener container. The failure log identifies the topic, partition and offset. The failed record stays uncommitted, so subsequent records in its partition wait for operator intervention. The other topic listener and HTTP service can continue with the state already applied. Inspect the record and fix the cause before resuming consumption. A permanent schema error requires a compatible reader or a reviewed rebuild of the input history. Appending a corrected record or changing a committed offset alone cannot repair an earlier invalid record during replay.
+
+### Recovery contract
+
+Run one app instance per consumer group. At every startup, JSON supplies the baseline. Before HTTP or scheduled cleanup starts, a manually assigned Kafka consumer captures the exclusive end offset of every partition and replays from zero up to those offsets through the same validation and update methods as live listeners. Only after successful replay does it commit those exact boundaries. Live listeners then consume messages at or beyond the boundaries, including records produced during startup. An invalid historical record fails startup. The replay logs the boundary offsets.
+
+Keep the seed unchanged, the event partition count fixed, and all input history intact. The Compose broker uses a named volume, unlimited time/size retention and Kafka's delete policy. Event deltas require full history, so compaction would invalidate recovery. Startup rejects a truncated partition with a nonzero beginning offset. Replacing a topic or deleting the volume destroys history. Disk usage and restart time grow with history. Event IDs identify one fixture throughout its lifecycle. Reusing or rescheduling an already cleaned-up event under the same ID with only a partial delta is unsupported because wall-clock cleanup itself is not in the input log.
+
+### Test with a real broker
+
+The integration test publishes a deliberately malformed event key. Give it a fresh, dedicated broker, separate from the demo. With Java 21 on the host:
+
+```sh
+KAFKA_PORT=19093 docker compose -p offer-it up -d --wait kafka
+./mvnw -Pkafka-it -Dkafka.it.bootstrap-servers=localhost:19093 clean verify
+KAFKA_PORT=19093 docker compose -p offer-it down --volumes
+```
+
+The last command deletes only this dedicated test project's volumes so the next run starts with empty topics. The suite covers filesystem validation, HTTP filtering, cleanup, stream merge and replacement, recovery with an existing consumer group, and failure readiness/offsets.
