@@ -11,11 +11,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class Utf8DeserializerTest {
     @Test
     void preservesUnicodeAndRejectsCorruptBytesInsideAJsonString() {
-        var decoder = new Utf8Deserializer();
-        var json = "{\"name\":\"Željezničar\"}";
-        var bytes = json.getBytes(StandardCharsets.UTF_8);
-        assertEquals(json, decoder.deserialize("event", bytes));
-        bytes[bytes.length - 3] = (byte) 0xff;
-        assertThrows(SerializationException.class, () -> decoder.deserialize("event", bytes));
+        try (var decoder = new Utf8Deserializer()) {
+            var json = "{\"name\":\"Željezničar\"}";
+            var bytes = json.getBytes(StandardCharsets.UTF_8);
+            assertEquals(json, decoder.deserialize("event", bytes));
+            bytes[bytes.length - 3] = (byte) 0xff;
+            assertThrows(SerializationException.class, () -> decoder.deserialize("event", bytes));
+        }
     }
 }
