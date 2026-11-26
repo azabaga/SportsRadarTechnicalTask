@@ -15,6 +15,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -30,14 +31,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class OfferServiceTest {
     private static final Instant NOW = Instant.parse("2030-06-01T20:00:00Z");
     private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
+    private static final LocalDate TODAY = LocalDate.ofInstant(NOW, ZoneOffset.UTC);
+    private static final LocalDate TOMORROW = TODAY.plusDays(1);
+    private static final MarketOutcome USED_OUTCOME_DEFINITION = definition("used", ACTIVE);
 
     @Test
     void appliesAllVisibilityRulesAndRetainsUnresolvedReferencesForLaterUpdates() {
         var market = market("m", ACTIVE,
-                definition("used", ACTIVE), definition("inactive-definition", INACTIVE),
+                USED_OUTCOME_DEFINITION, definition("inactive-definition", INACTIVE),
                 definition("inactive-instance", ACTIVE));
         var otherMarket = market("other", ACTIVE, definition("only-in-other-market", ACTIVE));
-        var inactiveMarket = market("inactive-market", INACTIVE, definition("used", ACTIVE));
+        var inactiveMarket = market("inactive-market", INACTIVE, USED_OUTCOME_DEFINITION);
         var valid = eventMarket("a-valid", "m", ACTIVE,
                 outcome("1", "used", ACTIVE),
                 outcome("2", "inactive-instance", INACTIVE),
@@ -67,10 +71,10 @@ class OfferServiceTest {
         assertEquals(5, store.snapshot().events().stream()
                 .filter(event -> event.id().equals("visible")).findFirst().orElseThrow().markets().size());
 
-        store.updateMarket(market("missing-market", ACTIVE, definition("used", ACTIVE)));
+        store.updateMarket(market("missing-market", ACTIVE, USED_OUTCOME_DEFINITION));
         assertEquals(List.of("unresolved", "visible"), eventIds(service.getOffer(null, null)));
 
-        store.updateMarket(market("m", ACTIVE, definition("used", ACTIVE), definition("missing", ACTIVE)));
+        store.updateMarket(market("m", ACTIVE, USED_OUTCOME_DEFINITION, definition("missing", ACTIVE)));
         assertEquals(List.of("empty", "unresolved", "visible"), eventIds(service.getOffer(null, null)));
     }
 
@@ -100,35 +104,42 @@ class OfferServiceTest {
                 new Offer.OutcomeDefinition("a", "shared", "shared"),
                 new Offer.OutcomeDefinition("b", "shared", "shared")), all.marketOutcomes());
 
-        var filtered = service.getOffer(LocalDate.parse("2030-06-02"), null);
+        var filtered = service.getOffer(TOMORROW, null);
         assertEquals(List.of("c"), eventIds(filtered));
         assertEquals(List.of(new Offer.MarketDefinition("a", "a", List.of("shared")),
                 new Offer.MarketDefinition("b", "b", List.of("shared"))), filtered.markets());
         assertEquals(List.of(new Offer.OutcomeDefinition("a", "shared", "shared"),
                 new Offer.OutcomeDefinition("b", "shared", "shared")), filtered.marketOutcomes());
-        assertEquals(List.of("a"), service.getOffer(null, LocalDate.parse("2030-06-01")).markets().stream()
+        assertEquals(List.of("a"), service.getOffer(null, TODAY).markets().stream()
                 .map(Offer.MarketDefinition::id).toList());
     }
 
     @Test
     void includesBothEndsOfTheUtcCalendarDayAndTheExactStartInstant() {
         var visible = eventMarket("em", "m", ACTIVE, outcome("eo", "used", ACTIVE));
-        var store = new InMemoryOfferStore(List.of(market("m", ACTIVE, definition("used", ACTIVE))), List.of(
-                event("just-started", NOW.minusNanos(1), ACTIVE, visible),
-                event("now", NOW, ACTIVE, visible),
-                event("midnight", Instant.parse("2030-06-02T00:00:00Z"), ACTIVE, visible),
-                event("end-of-day", Instant.parse("2030-06-02T23:59:59.999999999Z"), ACTIVE, visible),
-                event("next-midnight", Instant.parse("2030-06-03T00:00:00Z"), ACTIVE, visible)));
-        var service = new OfferService(store, CLOCK);
-        var june2 = LocalDate.parse("2030-06-02");
+        var startOfDay = TOMORROW.atStartOfDay().toInstant(ZoneOffset.UTC);
+        var endOfDay = TOMORROW.atTime(LocalTime.MAX).toInstant(ZoneOffset.UTC);
+        var startOfNextDay = TOMORROW.plusDays(1).atStartOfDay().toInstant(ZoneOffset.UTC);
 
-        assertEquals(List.of("now", "midnight", "end-of-day", "next-midnight"), eventIds(service.getOffer(null, null)));
-        assertEquals(List.of("midnight", "end-of-day"), eventIds(service.getOffer(june2, june2)));
-        assertEquals(List.of("now", "midnight", "end-of-day"), eventIds(service.getOffer(null, june2)));
-        assertEquals(List.of("midnight", "end-of-day", "next-midnight"), eventIds(service.getOffer(june2, null)));
+        var alreadyStarted = new Event("1", "Real Madrid - Barcelona", NOW.minusNanos(1), ACTIVE, List.of(visible));
+        var startsNow = new Event("2", "BiH - Nigerija", NOW, ACTIVE, List.of(visible));
+        var startsAtDayStart = new Event("3", "Milan - Inter", startOfDay, ACTIVE, List.of(visible));
+        var startsAtDayEnd = new Event("4", "Roma - Lazio", endOfDay, ACTIVE, List.of(visible));
+        var startsNextDay = new Event("5", "Porto - Benfica", startOfNextDay, ACTIVE, List.of(visible));
+        var store = new InMemoryOfferStore(List.of(market("m", ACTIVE, USED_OUTCOME_DEFINITION)),
+                List.of(alreadyStarted, startsNow, startsAtDayStart, startsAtDayEnd, startsNextDay));
+        var service = new OfferService(store, CLOCK);
+
+        assertEquals(List.of(startsNow.id(), startsAtDayStart.id(), startsAtDayEnd.id(), startsNextDay.id()),
+                eventIds(service.getOffer(null, null)));
+        assertEquals(List.of(startsAtDayStart.id(), startsAtDayEnd.id()), eventIds(service.getOffer(TOMORROW, TOMORROW)));
+        assertEquals(List.of(startsNow.id(), startsAtDayStart.id(), startsAtDayEnd.id()),
+                eventIds(service.getOffer(null, TOMORROW)));
+        assertEquals(List.of(startsAtDayStart.id(), startsAtDayEnd.id(), startsNextDay.id()),
+                eventIds(service.getOffer(TOMORROW, null)));
 
         Clock nextTick = Clock.offset(CLOCK, Duration.ofNanos(1));
-        assertEquals(List.of("midnight", "end-of-day", "next-midnight"),
+        assertEquals(List.of(startsAtDayStart.id(), startsAtDayEnd.id(), startsNextDay.id()),
                 eventIds(new OfferService(store, nextTick).getOffer(null, null)));
         assertEquals(5, store.snapshot().events().size());
     }
@@ -184,14 +195,15 @@ class OfferServiceTest {
                 snapshot.events().getFirst());
         assertEquals(initial, oldSnapshot.events().getFirst());
         assertEquals(2, oldSnapshot.markets().get("m").outcomes().size());
-        var offer = new OfferService(store, CLOCK).getOffer(null, null);
+        var service = new OfferService(store, CLOCK);
+        var offer = service.getOffer(null, null);
         assertEquals("new name", offer.markets().getFirst().name());
         assertEquals("new label", offer.marketOutcomes().getFirst().name());
         assertEquals(List.of(new Offer.VisibleOutcome("a1", "first", 2.0)),
                 offer.events().getFirst().markets().getFirst().outcomes());
 
         store.updateEvent(event("new-event", NOW, ACTIVE, updatedA));
-        assertTrue(eventIds(new OfferService(store, CLOCK).getOffer(null, null)).contains("new-event"));
+        assertTrue(eventIds(service.getOffer(null, null)).contains("new-event"));
     }
 
     @Test
