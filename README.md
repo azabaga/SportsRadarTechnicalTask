@@ -12,7 +12,7 @@ curl -fsS http://localhost:8080/health/ready
 curl -fsS http://localhost:8080/offer
 ```
 
-Open [Redpanda Console](http://localhost:8081) and select **Topics**, then **market** or **event**, then **Messages** to inspect records and event keys. The [OpenAPI specification](http://localhost:8080/openapi.yaml) documents the public response. The first build needs internet access to pull images and Maven dependencies. Compose runs the Java build and unit tests in the builder image.
+Open [Redpanda Console](http://localhost:8081) and select **Topics**, then **market** or **event**, then **Messages** to inspect records and event keys. Open [Swagger UI](http://localhost:8080/docs.html) to explore the endpoints and run requests. The [OpenAPI YAML](http://localhost:8080/openapi.yaml) is also available. The first build needs internet access to pull images and Maven dependencies. Compose runs the Java build and unit tests in the builder image.
 
 `docker compose ps` shows service status. Use `docker compose logs -f app` to follow replay boundaries, partition assignment, cleanup counts and rejected records. `GET /health/live` checks the HTTP process. With Kafka enabled, `GET /health/ready` returns 200 after startup replay when both topic listeners are running with assignments, or 503 while waiting or after a listener stops. It does not measure consumer lag. Host ports bind to loopback. Override `OFFER_PORT`, `KAFKA_PORT` and `CONSOLE_PORT` if occupied.
 
@@ -26,7 +26,7 @@ On a freshly started stack with empty topics, run the following from the project
 python3 scripts/demo.py
 ```
 
-The demo prints and checks the filtered Appendix 1 offer, publishes both Appendix 2 examples, adds a second market to event 3 and verifies that its original market survives. It restarts the app, compares the full HTTP response, then publishes a short-lived event, observes it expire and checks the scheduled removal log. The fixed appendix examples require the current clock to be before June 2, 2030 at 20:00 UTC. Automated tests use a fixed clock. The demo writes to the selected Compose project. To repeat against a fresh dedicated environment, select an unused Compose project name and unused host ports:
+The demo prints the filtered Appendix 1 offer and publishes both Appendix 2 fixtures. It adds a second market to event 3, deactivates and reactivates its definition and outcome, and checks the resulting HTTP responses. It compares the offer across an app restart, then publishes a short-lived event and waits for both HTTP expiry and scheduled removal. The fixed appendix examples require the current clock to be before June 2, 2030 at 20:00 UTC. The demo writes to the selected Compose project. To repeat against a fresh dedicated environment, select an unused Compose project name and unused host ports:
 
 ```sh
 export COMPOSE_PROJECT_NAME=offer-demo2 OFFER_PORT=18080 KAFKA_PORT=19092 CONSOLE_PORT=18081
@@ -109,10 +109,11 @@ An event market's `marketId` refers to `markets[].id`. Resolve an `outcomeId` us
 - `InMemoryOfferStore` serializes updates, cleanup and the capture of both collections with one lock. Each request takes a shallow immutable snapshot and projects it outside the lock. Separate market and event updates are individually atomic.
 - `OfferController` validates the query. `OfferService` filters events, resolves only active references, and collects the definitions actually used. `OfferCleanup` applies the same clock rule to remove records from the store.
 - `updateMarket` replaces the full definition. `updateEvent` uses the incoming event metadata and merges market instances by ID. Each supplied instance replaces its full outcome list, and absent instances remain.
+- An alternative seed provider supplies the two domain lists at the store's construction point. Another stream adapter can call the same two update methods. Neither change requires edits to merge or projection rules.
 
 ## Kafka updates
 
-Compose starts an unauthenticated Apache Kafka broker. The service provisions one `market` partition and two `event` partitions, with replication factor one. Existing event topics may have more partitions. To develop with the Java process on your host, start only the broker and UI in Compose:
+Compose starts an unauthenticated Apache Kafka broker. The service creates missing topics with replication factor one, one `market` partition and two `event` partitions. An existing `market` topic must have exactly one partition and an existing `event` topic must have at least two. Incompatible counts fail startup. Resizing a populated event topic can send later records for the same key to a different partition. To develop with the Java process on your host, start only the broker and UI in Compose:
 
 ```sh
 docker compose up -d --wait kafka console
@@ -146,11 +147,11 @@ Once consumed, the response shows odds of `1.9` for the updated outcome.
 
 Run one app instance per consumer group. At every startup, JSON supplies the baseline. Before HTTP or scheduled cleanup starts, a manually assigned Kafka consumer captures the exclusive end offset of every partition and replays from zero up to those offsets through the same validation and update methods as live listeners. Only after successful replay does it commit those exact boundaries. Live listeners then consume messages at or beyond the boundaries, including records produced during startup. An invalid historical record fails startup. The replay logs the boundary offsets.
 
-Keep the seed unchanged, the event partition count fixed, and all input history intact. The Compose broker uses a named volume, unlimited time/size retention and Kafka's delete policy. Event deltas require full history, so compaction would invalidate recovery. Startup rejects a truncated partition with a nonzero beginning offset. Replacing a topic or deleting the volume destroys history. Disk usage and restart time grow with history. Event IDs identify one fixture throughout its lifecycle. Reusing or rescheduling an already cleaned-up event under the same ID with only a partial delta is unsupported because wall-clock cleanup itself is not in the input log.
+Keep the seed unchanged, the event partition count fixed, and all input history intact. The Compose broker uses a named volume, unlimited time/size retention and Kafka's delete policy. Event deltas require full history, so compaction would invalidate recovery. Startup rejects a truncated partition with a nonzero beginning offset. Replacing a topic or deleting the volume destroys history. Disk usage and restart time grow with history. Use a new event ID when reviving a fixture after cleanup. A live delta for a removed ID starts a fresh event in memory. Replay can recover markets from that ID’s earlier history because the removal itself never entered the log.
 
 ### Test with a real broker
 
-The integration test publishes a deliberately malformed event key. Give it a fresh, dedicated broker, separate from the demo. With Java 21 on the host:
+The integration suite writes deliberately invalid market and event records. It requires an explicit broker address and checks that the `market` and `event` topics are absent before running. Use a fresh dedicated broker. With Java 21 on the host:
 
 ```sh
 KAFKA_PORT=19093 docker compose -p offer-it up -d --wait kafka

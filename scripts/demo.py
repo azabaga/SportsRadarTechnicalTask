@@ -50,6 +50,21 @@ extra = {"id": "3-2", "marketId": "total", "status": 1, "outcomes": [
 publish("event", dict(event, markets=[extra]))
 wait_for("Delta preserved 3-1 and added 3-2",
          lambda: [m["id"] for m in event_markets("3")] == ["3-1", "3-2"])
+with_total = offer()
+without_total = dict(market, status=0)
+publish("market", without_total)
+wait_for("Inactive total market hidden from event 3",
+         lambda: [m["id"] for m in event_markets("3")] == ["3-1"])
+assert all(m["id"] != "total" for m in offer()["markets"])
+publish("market", market)
+wait_for("Market reactivation restored the original offer", lambda: offer() == with_total)
+publish("market", dict(market, outcomes=[dict(o, status=0) if o["id"] == "total-0.5" else o
+                                        for o in market["outcomes"]]))
+wait_for("Inactive outcome hid the last selection in 3-2",
+         lambda: [m["id"] for m in event_markets("3")] == ["3-1"])
+assert all(o["marketId"] != "total" for o in offer()["marketOutcomes"])
+publish("market", market)
+wait_for("Outcome reactivation restored the original offer", lambda: offer() == with_total)
 assert offer("?from=2032-05-01&to=2032-05-01") == initial
 before_restart = offer()
 subprocess.run(["docker", "compose", "restart", "app"], check=True)
