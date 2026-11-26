@@ -88,7 +88,7 @@ class KafkaOfferUpdatesIT {
                         && preserved.size() == 1 && findById(preserved, "1-2-1").path("odds").asDouble() == 1.8;
             });
 
-            producer.send(new ProducerRecord<>("market", "3way", """
+            var replacement = producer.send(new ProducerRecord<>("market", "3way", """
                     {"id":"3way","name":"Match winner","status":1,"outcomes":[
                       {"id":"3way-1","name":"Home","status":1}]}
                     """)).get(10, TimeUnit.SECONDS);
@@ -103,11 +103,22 @@ class KafkaOfferUpdatesIT {
                         && !findById(event.path("markets"), "1-2").isMissingNode();
             });
 
+            var eventPartition = new TopicPartition("event", delta.partition());
+            var marketPartition = new TopicPartition("market", replacement.partition());
+            await("both update offsets to be committed before restart", () -> {
+                var offsets = admin.listConsumerGroupOffsets(group)
+                        .partitionsToOffsetAndMetadata().get(5, TimeUnit.SECONDS);
+                var eventOffset = offsets.get(eventPartition);
+                var marketOffset = offsets.get(marketPartition);
+                return eventOffset != null && eventOffset.offset() == delta.offset() + 1
+                        && marketOffset != null && marketOffset.offset() == replacement.offset() + 1;
+            });
+
             var beforeRestart = getOffer(http, request);
             context.close();
             try (var restarted = start(bootstrap, group)) {
                 var restoredRequest = HttpRequest.newBuilder(URI.create("http://127.0.0.1:"
-                        + restarted.getWebServer().getPort() + "/offer")).build();
+                        + restarted.getWebServer().getPort() + "/offer")).timeout(Duration.ofSeconds(5)).build();
                 assertEquals(beforeRestart, getOffer(http, restoredRequest));
                 var rejected = producer.send(new ProducerRecord<>("event", "1", """
                         {"id":"different","name":"Wrong key","startsAt":"2032-05-01T20:00:00","status":1,"markets":[]}
@@ -123,7 +134,8 @@ class KafkaOfferUpdatesIT {
                 var offsets = admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS);
                 assertEquals(rejected.offset(), offsets.get(new TopicPartition("event", rejected.partition())).offset());
                 assertEquals("Real Barcelona updated", findById(getOffer(http, restoredRequest).path("events"), "1").path("name").asString());
-                var ready = HttpRequest.newBuilder(restoredRequest.uri().resolve("/health/ready")).build();
+                var ready = HttpRequest.newBuilder(restoredRequest.uri().resolve("/health/ready"))
+                        .timeout(Duration.ofSeconds(5)).build();
                 assertEquals(503, http.send(ready, HttpResponse.BodyHandlers.ofString()).statusCode());
             }
         }

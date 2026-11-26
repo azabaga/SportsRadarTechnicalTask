@@ -24,7 +24,8 @@ public final class InMemoryOfferStore {
     }
 
     public synchronized void updateEvent(Event event) {
-        events.merge(event.id(), event, InMemoryOfferStore::mergeEventMarkets);
+        events.merge(event.id(), event,
+                (current, update) -> mergeEventMarkets(current, update));
     }
 
     private static Event mergeEventMarkets(Event current, Event update) {

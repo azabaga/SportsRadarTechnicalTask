@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.servlet.context.ServletWebServerApplicationContext;
 import org.springframework.context.support.GenericApplicationContext;
@@ -71,12 +72,15 @@ class OfferHttpTest {
                   "marketOutcomes": [{"marketId": "3way", "id": "3way-1", "name": "1"}]
                 }
                 """), JSON.readTree(response.body()));
-        assertEquals(JSON.readTree(response.body()), JSON.readTree(get("").body()));
+        var unfiltered = get("");
+        assertEquals(200, unfiltered.statusCode());
+        assertEquals(JSON.readTree(response.body()), JSON.readTree(unfiltered.body()));
     }
 
-    @Test
-    void returnsEmptyArraysWhenNoEventsMatchTheDateFilter() throws Exception {
-        var response = get("?to=2032-04-30");
+    @ParameterizedTest
+    @ValueSource(strings = {"?to=2032-04-30", "?from=2032-05-02"})
+    void returnsEmptyArraysWhenEitherDateBoundExcludesTheOnlyUpcomingEvent(String query) throws Exception {
+        var response = get(query);
         assertEquals(200, response.statusCode());
         assertEquals(JSON.readTree("""
                 {"events":[],"markets":[],"marketOutcomes":[]}
