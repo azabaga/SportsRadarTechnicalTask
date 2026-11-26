@@ -2,6 +2,8 @@
 
 This Java 21 service loads a filesystem seed, applies ordered Kafka updates to an in-memory offer and serves active upcoming events over HTTP.
 
+Project tasks are tracked in the [STI Jira project](https://azabaga.atlassian.net/jira/software/projects/STI/boards/2?filter=&groupBy=none).
+
 ## Start the complete service
 
 From the repository root, with Docker Engine and Docker Compose installed, run:
